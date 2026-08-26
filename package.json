@@ -1,0 +1,11 @@
+{
+  "name": "com.orbitope.parlance",
+  "version": "0.1.0",
+  "displayName": "Parlance",
+  "description": "A Unity runtime for Parlance, a git-native narrative design tool for story-driven games.",
+  "unity": "2021.3",
+  "author": {
+    "name": "Orbitope"
+  },
+  "dependencies": {}
+}
