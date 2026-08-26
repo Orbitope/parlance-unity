@@ -15,8 +15,6 @@ obj/
 # Visual Studio / Rider
 .vs/
 .idea/
-*.sln
-*.csproj
 *.user
 *.suo
 
