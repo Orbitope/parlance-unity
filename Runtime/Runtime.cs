@@ -378,6 +378,36 @@ namespace Parlance
                 return new Dictionary<string, object> { { "error", $"node '{nodeId}' does not exist in dialogue '{diagId}'" } };
             }
 
+            // Node-level showIf skip walk (contract 0.11.0): stepping onto a gated
+            // node whose gate fails resolves to the node the player actually sees —
+            // the same skip AdvanceNode performs, so a caller landing here by any path
+            // renders the shown node, not the hidden one. A ring of failing gates is
+            // COND-invalid and reported rather than looped.
+            {
+                var seen = new HashSet<string>();
+                while (node.TryGetValue("showIf", out var gateObj)
+                       && !Evaluate(gateObj as Dictionary<string, object> ?? new Dictionary<string, object>(), state, project))
+                {
+                    string here = node.TryGetValue("id", out var hId) ? hId.ToString() : nodeId;
+                    if (!seen.Add(here))
+                    {
+                        return new Dictionary<string, object> { { "error", "Cycle among conditional nodes: resolution cannot escape" } };
+                    }
+                    if (!node.ContainsKey("next"))
+                    {
+                        return new Dictionary<string, object> { { "error", $"conditional node '{here}' has no 'next' to skip to" } };
+                    }
+                    string nextId = node["next"]?.ToString();
+                    var nextNode = FindNode(dialogue, nextId);
+                    if (nextNode == null)
+                    {
+                        string diagId = dialogue.TryGetValue("id", out var dId) ? dId.ToString() : "?";
+                        return new Dictionary<string, object> { { "error", $"next target '{nextId}' does not exist in dialogue '{diagId}'" } };
+                    }
+                    node = nextNode;
+                }
+            }
+
             var visible = new List<object>();
             if (node.TryGetValue("choices", out var choicesObj) && choicesObj is IEnumerable<object> choicesList)
             {
@@ -511,10 +541,34 @@ namespace Parlance
 
             object targetIdObj = node["next"];
             string targetId = targetIdObj != null ? targetIdObj.ToString() : null;
-            if (FindNode(dialogue, targetId) == null)
+
+            // Node-level showIf skip walk (contract 0.11.0). If the target node is
+            // gated and its gate fails, cross it to its own `next` and keep walking
+            // until a node with no gate — or a passing gate — is reached; that is the
+            // node the player sees. A ring of all-failing gates cannot escape (it is
+            // COND-invalid data) and is reported rather than looped forever. onEnter
+            // is NOT fired here: advance is navigation, exactly as the ungated path is.
+            var emptyProject = new Dictionary<string, object>();
+            var visited = new HashSet<string>();
+            while (true)
             {
-                string diagId = dialogue.TryGetValue("id", out var dId) ? dId.ToString() : "?";
-                return new Dictionary<string, object> { { "error", $"next target '{targetId}' does not exist in dialogue '{diagId}'" } };
+                var targetNode = FindNode(dialogue, targetId);
+                if (targetNode == null)
+                {
+                    string diagId = dialogue.TryGetValue("id", out var dId) ? dId.ToString() : "?";
+                    return new Dictionary<string, object> { { "error", $"next target '{targetId}' does not exist in dialogue '{diagId}'" } };
+                }
+                if (!targetNode.TryGetValue("showIf", out var gateObj)) break;
+                if (Evaluate(gateObj as Dictionary<string, object> ?? new Dictionary<string, object>(), state, emptyProject)) break;
+                if (!visited.Add(targetId))
+                {
+                    return new Dictionary<string, object> { { "error", "Cycle among conditional nodes: resolution cannot escape" } };
+                }
+                if (!targetNode.ContainsKey("next"))
+                {
+                    return new Dictionary<string, object> { { "error", $"conditional node '{targetId}' has no 'next' to skip to" } };
+                }
+                targetId = targetNode["next"]?.ToString();
             }
 
             return new Dictionary<string, object>
