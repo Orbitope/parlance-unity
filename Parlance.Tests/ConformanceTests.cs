@@ -125,14 +125,18 @@ namespace Parlance.Tests
                     ids.Add(choice.ContainsKey("id") ? choice["id"] : null);
                 }
                 var onEnterEffects = (IEnumerable<object>)outDict["onEnterEffects"];
-                
-                int count = 0;
-                foreach (var _ in onEnterEffects) count++;
-                
+
+                var onEnterList = new List<object>();
+                foreach (var e in onEnterEffects) onEnterList.Add(e);
+
+                var outNode = (Dictionary<string, object>)outDict["node"];
+
                 var got = new Dictionary<string, object>
                 {
+                    { "nodeId", outNode.TryGetValue("id", out var idObj) ? idObj : null },
                     { "visibleChoiceIds", ids },
-                    { "onEnterEffectCount", count }
+                    { "onEnterEffectCount", onEnterList.Count },
+                    { "onEnterEffects", onEnterList }
                 };
                 AssertDeepEqual((Dictionary<string, object>)v["expected"], got, (string)v["description"]);
             }
