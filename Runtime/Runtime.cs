@@ -13,6 +13,26 @@ namespace Parlance
             return _Evaluate(condition, state, project, new Dictionary<string, bool>());
         }
 
+        // How specific a condition is, for offer ranking: absent 0, leaf 1,
+        // all = sum, any = min (0 if empty), not = its operand's.
+        public static int ConditionSpecificity(object conditionObj)
+        {
+            if (!(conditionObj is Dictionary<string, object> condition)) return 0;
+            string type = condition.TryGetValue("type", out var typeObj) && typeObj is string t ? t : "";
+            condition.TryGetValue("of", out var ofObj);
+            switch (type)
+            {
+                case "all":
+                    return ofObj is IEnumerable<object> allOf ? allOf.Sum(ConditionSpecificity) : 0;
+                case "any":
+                    return ofObj is IEnumerable<object> anyOf && anyOf.Any() ? anyOf.Min(ConditionSpecificity) : 0;
+                case "not":
+                    return ConditionSpecificity(ofObj);
+                default:
+                    return 1;
+            }
+        }
+
         private static bool _Evaluate(object conditionObj, State state, Dictionary<string, object> project, Dictionary<string, bool> visiting)
         {
             if (!(conditionObj is Dictionary<string, object> condition)) return false;
@@ -300,8 +320,17 @@ namespace Parlance
         
         // ------------------------------------------------------------ resolveCheck --
 
-        public static Dictionary<string, object> ResolveCheck(Dictionary<string, object> check, State state, Func<float> rng, object defaultDice = null, bool criticals = false)
+        // A check that declares modifiers needs the project to evaluate their
+        // `when` (quest conditions read stage order); without one this returns
+        // an error rather than read those conditions as silently false.
+        public static Dictionary<string, object> ResolveCheck(Dictionary<string, object> check, State state, Func<float> rng, object defaultDice = null, bool criticals = false, Dictionary<string, object> project = null)
         {
+            bool hasModifiers = check.TryGetValue("modifiers", out var modsObj) && modsObj is IEnumerable<object> modsList && modsList.Any();
+            if (hasModifiers && project == null)
+            {
+                return new Dictionary<string, object> { { "error", "ResolveCheck: check has modifiers; pass project" } };
+            }
+
             object diceObj = check.TryGetValue("dice", out var dObj) ? dObj : defaultDice;
             string notation = diceObj != null ? diceObj.ToString() : "1d20";
             var spec = ParseDice(notation);
@@ -317,7 +346,8 @@ namespace Parlance
 
             string skill = check.TryGetValue("skill", out var s) && s is string sStr ? sStr : "";
             float skillValue = state.Skills.TryGetValue(skill, out var sv) ? sv : 0f;
-            float total = roll + skillValue;
+            var mod = hasModifiers ? CheckBonus(check, state, project) : (bonus: 0f, appliedModifiers: new List<object>());
+            float total = roll + skillValue + mod.bonus;
             
             float difficulty = check.TryGetValue("difficulty", out var diffObj) ? Convert.ToSingle(diffObj) : 0f;
             bool passed = total >= difficulty;
@@ -330,6 +360,13 @@ namespace Parlance
                 { "skillValue", skillValue },
                 { "dice", $"{spec.n}d{spec.m}" }
             };
+            // Present only when the check declares a modifier, so an unmodified
+            // check's result is unchanged from before modifiers existed.
+            if (hasModifiers)
+            {
+                result["bonus"] = mod.bonus;
+                result["appliedModifiers"] = mod.appliedModifiers;
+            }
 
             if (criticals)
             {
@@ -353,6 +390,39 @@ namespace Parlance
             }
 
             return result;
+        }
+
+        // Sum of every modifier's bonus whose `when` holds, and the indices that
+        // contributed, in array order. The one place modifiers are summed.
+        public static (float bonus, List<object> appliedModifiers) CheckBonus(Dictionary<string, object> check, State state, Dictionary<string, object> project = null)
+        {
+            float bonus = 0f;
+            var applied = new List<object>();
+            if (check.TryGetValue("modifiers", out var modsObj) && modsObj is IEnumerable<object> mods)
+            {
+                int i = 0;
+                foreach (var mObj in mods)
+                {
+                    if (mObj is Dictionary<string, object> m
+                        && Evaluate(m.TryGetValue("when", out var w) ? w as Dictionary<string, object> : null, state, project))
+                    {
+                        bonus += m.TryGetValue("bonus", out var b) ? Convert.ToSingle(b) : 0f;
+                        applied.Add(i);
+                    }
+                    i++;
+                }
+            }
+            return (bonus, applied);
+        }
+
+        // The passive-check reveal threshold: skill + bonus >= difficulty.
+        // Passive checks never roll; use this to show or hide the choice.
+        public static bool PassiveCheckPasses(Dictionary<string, object> check, State state, Dictionary<string, object> project = null)
+        {
+            string skill = check.TryGetValue("skill", out var s) && s is string sStr ? sStr : "";
+            float skillValue = state.Skills.TryGetValue(skill, out var sv) ? sv : 0f;
+            float difficulty = check.TryGetValue("difficulty", out var diffObj) ? Convert.ToSingle(diffObj) : 0f;
+            return skillValue + CheckBonus(check, state, project).bonus >= difficulty;
         }
 
         private static (int n, int m) ParseDice(string notation)
@@ -492,7 +562,8 @@ namespace Parlance
                     object defaultDice = checkRules.TryGetValue("dice", out var ddObj) ? ddObj : null;
                     bool criticals = checkRules.TryGetValue("criticals", out var critObj) && critObj is bool cBool ? cBool : false;
                     
-                    var result = ResolveCheck(check, nextState, rng, defaultDice, criticals);
+                    var result = ResolveCheck(check, nextState, rng, defaultDice, criticals, project);
+                    if (result.ContainsKey("error")) return result;
                     bool passed = (bool)result["passed"];
                     
                     object nextNodeId = null;
@@ -578,25 +649,55 @@ namespace Parlance
             };
         }
         
-        // ------------------------------------------- resolveCharacterDialogue (feed) --
+        // ----------------------------------------- resolveCharacterDialogue (offers) --
         
-        public static object ResolveCharacterDialogue(State state, Dictionary<string, object> character, Dictionary<string, object> project = null)
+        // The dialogue this character offers right now, or null. Candidates are
+        // dialogues carrying an `offer` whose `offer.character ?? speakerId` is
+        // this character; those whose `when` fails, and (given `visited`) any
+        // visited non-replayable one, are dropped. The winner is the highest
+        // priority tier, then the most specific `when`, then the lowest id by
+        // ordinal compare. Order in the project never matters.
+        public static object ResolveCharacterDialogue(State state, Dictionary<string, object> character, Dictionary<string, object> project = null, IEnumerable<object> visited = null)
         {
             if (project == null) project = new Dictionary<string, object>();
-            
-            if (character.TryGetValue("dialogues", out var dialoguesObj) && dialoguesObj is IEnumerable<object> dialoguesList)
+            if (!(project.TryGetValue("dialogues", out var dsObj) && dsObj is Dictionary<string, object> dialogues)) return null;
+
+            object characterId = character.TryGetValue("id", out var cid) ? cid : null;
+            var seen = visited != null ? new HashSet<string>(visited.Select(x => x?.ToString())) : null;
+
+            Dictionary<string, object> best = null;
+            foreach (var dObj in dialogues.Values)
             {
-                foreach (var rungObj in dialoguesList)
-                {
-                    if (!(rungObj is Dictionary<string, object> rung)) continue;
-                    if (rung.TryGetValue("showIf", out var showIfObj))
-                    {
-                        if (!Evaluate(showIfObj as Dictionary<string, object> ?? new Dictionary<string, object>(), state, project)) continue;
-                    }
-                    return rung.TryGetValue("dialogue", out var diagObj) ? diagObj : null;
-                }
+                if (!(dObj is Dictionary<string, object> dialogue)) continue;
+                if (!(dialogue.TryGetValue("offer", out var oObj) && oObj is Dictionary<string, object> offer)) continue;
+
+                object offeredBy = offer.TryGetValue("character", out var oc) ? oc : (dialogue.TryGetValue("speakerId", out var sp) ? sp : null);
+                if (!Equals(offeredBy, characterId)) continue;
+
+                if (offer.TryGetValue("when", out var whenObj) && !Evaluate(whenObj as Dictionary<string, object>, state, project)) continue;
+
+                bool replayable = dialogue.TryGetValue("replayable", out var rp) && rp is bool rpb && rpb;
+                string id = dialogue.TryGetValue("id", out var idObj) ? idObj?.ToString() : null;
+                if (seen != null && !replayable && seen.Contains(id)) continue;
+
+                if (best == null || BetterOffer(dialogue, best)) best = dialogue;
             }
-            return null;
+            return best != null && best.TryGetValue("id", out var bestId) ? bestId : null;
+        }
+
+        private static bool BetterOffer(Dictionary<string, object> a, Dictionary<string, object> b)
+        {
+            var oa = (Dictionary<string, object>)a["offer"];
+            var ob = (Dictionary<string, object>)b["offer"];
+            int pa = oa.TryGetValue("priority", out var pao) ? Convert.ToInt32(pao) : 0;
+            int pb = ob.TryGetValue("priority", out var pbo) ? Convert.ToInt32(pbo) : 0;
+            if (pa != pb) return pa > pb;
+            int sa = ConditionSpecificity(oa.TryGetValue("when", out var wa) ? wa : null);
+            int sb = ConditionSpecificity(ob.TryGetValue("when", out var wb) ? wb : null);
+            if (sa != sb) return sa > sb;
+            string ia = a.TryGetValue("id", out var iao) ? iao?.ToString() ?? "" : "";
+            string ib = b.TryGetValue("id", out var ibo) ? ibo?.ToString() ?? "" : "";
+            return string.CompareOrdinal(ia, ib) < 0;
         }
 
         // ------------------------------------------------------ speaker / portrait --

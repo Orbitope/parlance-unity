@@ -4,15 +4,17 @@ A C# runtime for [Parlance](https://github.com/Orbitope/parlance), a git-native 
 
 **Parlance is the authoring tool; this is the Unity runtime for what it produces.** You write your story in Parlance's visual editor — dialogue and quest canvases, a searchable reference index, live playtest — and it saves as human-readable JSON directly in your repo. No database, no import/export step, git as the single source of truth.
 
-This package reads that JSON and runs it in Unity: dialogues, conditions, effects, skill checks, character dialogue ladders, quests, endings. It is verified against Parlance's published conformance vectors rather than against its author's confidence.
+This package reads that JSON and runs it in Unity: dialogues, conditions, effects, skill checks (with conditional modifiers), character dialogue offers, quests, endings. It is verified against Parlance's published conformance vectors rather than against its author's confidence.
 
 ## Compatibility
 
 | parlance-unity | Parlance spec | Families |
 |---|---|---|
-| `main` (unreleased) | v0.9.0 — pre-tag, pinned to [`1a4e657`](conformance/PIN) | 7 of 10 |
+| `main` (unreleased) | v0.14.0 — pinned to [`f4a25b0`](conformance/PIN) | 8 of 11 |
 
 [`conformance/PIN`](conformance/PIN) is the authoritative record of which upstream ref the vectors came from.
+
+Not ported yet: `resolveQuests`, `progression` and `nextContinuations`. Their vectors are vendored but no test runs them.
 
 ## Install
 
@@ -61,7 +63,7 @@ state = outcome["newState"];
 
 if (outcome.ContainsKey("checkResult"))
 {
-    Debug.Log(outcome["checkResult"]); // passed, roll, total, skillValue, dice
+    Debug.Log(outcome["checkResult"]); // passed, roll, total, skillValue, dice (+ bonus, appliedModifiers)
 }
 var nextNodeId = outcome.GetValueOrDefault("nextNodeId"); // null on a terminal choice
 ```
@@ -69,13 +71,15 @@ var nextNodeId = outcome.GetValueOrDefault("nextNodeId"); // null on a terminal 
 ### Important Notes
 - **`onEnter` effects are not applied for you.** `StepDialogue` returns them; firing them is the caller's job, on first arrival only. Applying them on every render double-counts on a rewind.
 - **A node with no choices is not necessarily over.** If it has `next`, call `AdvanceNode` — that's a listen-only beat. Treating it as the end silently truncates ambient chains.
+- **Passive checks never roll.** Show or hide a passive-check choice with `PassiveCheckPasses` (`skill + Σbonus >= difficulty`), so a check modifier means the same thing in both modes.
+- **Which dialogue a character opens is `ResolveCharacterDialogue`.** It ranks the dialogues whose `offer` names that character (priority tier, then condition specificity, then id); pass your visited set so non-replayable dialogues are not offered twice.
 
 ## Verify it yourself
 
 You can verify the runtime against the exact same conformance vectors used by the GDScript implementation. Since it's a pure C# library, you can run the NUnit tests from the command line without launching Unity:
 
 ```bash
-cd Tests
+cd Parlance.Tests
 dotnet test
 ```
 

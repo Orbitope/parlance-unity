@@ -92,7 +92,13 @@ namespace Parlance.Tests
                 var rngSpec = v.ContainsKey("rng") ? v["rng"] : 0.0f;
                 var rng = RngFrom(rngSpec);
                 
-                var got = Runtime.ResolveCheck(check, state, rng, defaultDice, criticals);
+                // A check with modifiers requires a project, as a real caller always
+                // has one: the vector's when it carries one (quest state), else {}.
+                bool hasModifiers = check.TryGetValue("modifiers", out var mods) && mods is List<object> modList && modList.Count > 0;
+                var project = v.ContainsKey("project") ? (Dictionary<string, object>)v["project"]
+                    : hasModifiers ? new Dictionary<string, object>() : null;
+
+                var got = Runtime.ResolveCheck(check, state, rng, defaultDice, criticals, project);
                 var want = (Dictionary<string, object>)v["expected"];
                 AssertDeepEqual(want, got, (string)v["description"]);
             }
@@ -229,7 +235,9 @@ namespace Parlance.Tests
                 var character = (Dictionary<string, object>)v["character"];
                 var project = v.ContainsKey("project") ? (Dictionary<string, object>)v["project"] : new Dictionary<string, object>();
                 
-                var got = Runtime.ResolveCharacterDialogue(state, character, project);
+                var visited = v.ContainsKey("visited") ? (List<object>)v["visited"] : null;
+                
+                var got = Runtime.ResolveCharacterDialogue(state, character, project, visited);
                 var expected = v["expected"];
                 
                 AssertDeepEqual(expected, got, (string)v["description"]);

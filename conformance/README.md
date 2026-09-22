@@ -18,18 +18,44 @@ Counts below drift every time vectors are added, so treat them as indicative and
 |---|---|---|
 | `evaluate.json` | `evaluate(condition, state, project)` | 53 |
 | `apply_effect.json` | `applyEffect(effect, state, project)` | 27 |
-| `resolve_check.json` | `resolveCheck(check, state, rng, defaultDice?, criticals?)` | 18 |
-| `step_dialogue.json` | `stepDialogue(dialogue, nodeId, state, project)` | 8 |
-| `choose_choice.json` | `chooseChoice(dialogue, nodeId, choiceId, state, project, rng)` | 9 |
-| `advance.json` | `advanceNode(dialogue, nodeId, state)` | 9 |
-| `resolveCharacterDialogue.json` | `resolveCharacterDialogue(state, character, project)` | 6 |
+| `resolve_check.json` | `resolveCheck(check, state, rng, defaultDice?, criticals?, project?)` | 24 |
+| `step_dialogue.json` | `stepDialogue(dialogue, nodeId, state, project)` | 11 |
+| `choose_choice.json` | `chooseChoice(dialogue, nodeId, choiceId, state, project, rng)` | 10 |
+| `advance.json` | `advanceNode(dialogue, nodeId, state, project)` | 12 |
+| `resolveCharacterDialogue.json` | `resolveCharacterDialogue(state, character, project, visited?)` | 16 |
+| `nextContinuations.json` | `nextContinuations(state, project, visited, currentDialogueId)` — forced routing vs discovery | 4 |
 | `progression.json` | `levelForXp` / `pointsEarned` / `availablePoints` / `investSkillPoint` / `recomputeSkills` | 13 |
 | `resolve_quests.json` | `resolveQuests(state, project)` | 6 |
 | `rng.json` | mulberry32(seed) output stream — the seeded PRNG ports must reproduce exactly | 6 |
 
-`advance.json` is the one file with a failure case: some vectors carry `expectedError` (a substring
-the thrown error must contain) instead of `expected` — see Error cases below. Every other file is
-`expected` + deep-equality only.
+### `migrate_ladders/` — vectors for the 0.13 → 0.14 ladder migration
+
+`migrate_ladders/vectors.json` holds input projects (characters with the retired
+`dialogues` ladder, dialogues with the retired `availableWhen`) beside the exact
+`offer` objects the reference migration writes and the report lines it prints.
+`tooling/scripts/migrate_ladders.py` (published beside the validator as
+`validate/migrate_ladders.py`) is the reference; `editor/core/src/migrateLadders.ts`
+is held to the same vectors. A port that converts 0.13 projects can replay them;
+one that only reads 0.14 projects can ignore this directory.
+
+### `validator/` — cases for the validator, not the runtime
+
+The JSON files above pin *runtime* behavior. `validator/cases/` pins the
+**validation rules** instead: each case is a small complete project with one
+seeded defect and an `expected.json` saying which issue codes must (and must
+not) be reported. They exist because this repo has two validators — the
+reference one in `tooling/validate.py` and the one inside the editor — and two
+implementations of one rule set drift silently: a rule that stops firing looks
+exactly like data with no defects.
+
+A port that ships its own validator can vendor these the same way, and check it
+agrees. See `validator/README.md` for the case format.
+
+Any runtime file may carry failure cases: a vector with `expectedError` (a substring
+the thrown error's message must contain) instead of `expected` means the call must
+throw. `advance.json` carries them for a missing `next` and for a ring of conditional
+nodes whose gates all fail — both validator-guaranteed impossibilities, thrown rather
+than absorbed because reaching them means the data never passed validation.
 
 ## Vector format
 
@@ -55,6 +81,8 @@ Each file is a JSON array. Each element is a self-contained test vector with the
   "choiceId":    string          // chooseChoice only
   "rng":         number | number[]  // resolveCheck and chooseChoice (active checks). Array = one value per die, in order
   "defaultDice": string          // resolveCheck only, optional — project rules.check.dice (absent ⇒ 1d20)
+                                 // resolveCheck also takes "project" (optional) — required only when the
+                                 // check declares modifiers whose `when` reads quest/questOutcome state
 
   // Expected output — exactly ONE of these two is present:
   "expected":      varies by fn  // see per-function sections below
@@ -142,16 +170,39 @@ carried through unchanged from the input state.
 
 ### resolveCheck
 ```json
-{ "expected": { "passed": true, "roll": 5, "total": 10, "skillValue": 5 } }
+{ "expected": { "passed": true, "roll": 5, "total": 10, "skillValue": 5, "dice": "1d20" } }
 ```
+`bonus` and `appliedModifiers` are present **iff the check declares at least one
+modifier** (0 / `[]` when none applied), so a check without modifiers produces the
+same result it did before the feature existed. `total = roll + skillValue + Σbonus`
+over every modifier whose `when` holds; a check with modifiers must be resolved with
+a `project`. `critical` is present only on a critical roll (see the roll model).
 
 ### stepDialogue
 ```json
-{ "expected": { "visibleChoiceIds": ["ch_goto", "ch_check"], "onEnterEffectCount": 1 } }
+{ "expected": {
+    "nodeId": "n_real",
+    "visibleChoiceIds": ["ch_goto", "ch_check"],
+    "onEnterEffectCount": 1,
+    "onEnterEffects": [{ "type": "set_flag", "flag": "visited_start", "value": true }]
+} }
 ```
+`nodeId` is the **resolved** node's id — `stepDialogue` walks past nodes whose own
+`showIf` fails (see `resolveNode` in `RUNTIME_CONTRACT.md`), so the node returned may not
+be the one requested. **Check it when present**, by the same reasoning as the effects note
+below: without it, a runtime that never implements the skip walk still passes every vector
+whose skipped node carries no `onEnter` — the *typical* gated narration line, since a
+conditional node is choiceless by construction. Older vectors omit the field.
+
 `visibleChoiceIds` is the ordered list of choice ids that pass `showIf` filtering.
-`onEnterEffectCount` is the count of effects in `node.onEnter` (they are returned but
-**not applied** — that is the caller's responsibility).
+`onEnterEffects` is `node.onEnter` in order — the effects are returned but **not
+applied**, which is the caller's responsibility.
+
+`onEnterEffectCount` is that list's length, kept for ports already checking it.
+**Check `onEnterEffects`, not the count.** The count alone is satisfied by
+returning the *choice's* effects instead of the node's, by returning them in
+reverse, or by returning the right number of nulls — all of which apply the
+wrong thing to the player's state while reporting conformance.
 
 ### chooseChoice
 ```json
@@ -175,8 +226,10 @@ Resolves `node.next` — the choiceless counterpart of `chooseChoice`, for liste
 **no effects are applied and no check is resolved** — `next` carries neither — so
 `newState` always equals the input `state`, byte-for-byte, even when the TARGET node has
 `onEnter` effects: those are the caller's responsibility on arrival, exactly as with
-`stepDialogue`'s `onEnterEffects` / a `goto` arrival, never `advanceNode`'s own job. Does
-not chase further `next` pointers — one call resolves exactly one hop.
+`stepDialogue`'s `onEnterEffects` / a `goto` arrival, never `advanceNode`'s own job. The
+returned `nextNodeId` is **post-skip**: the target is resolved through any failing node
+`showIf` gates, so it names the node the player will actually see. One call still reveals
+exactly one *shown* beat — skipped nodes are inert, not beats.
 
 **Error cases.** A vector with `expectedError` instead of `expected` means the call must
 throw; `expectedError` is a substring the thrown error's message must contain. This is the
@@ -186,18 +239,23 @@ otherwise); reaching it anyway is a bug upstream, not a `Problem`/result-object 
 
 ### resolveCharacterDialogue
 ```json
-{ "character": Character, "expected": "d_first_meeting" }   // or null
+{ "character": Character, "project": { "dialogues": {…} }, "visited": ["d_x"], "expected": "d_confront" }  // or null
 ```
-Walk `character.dialogues` (the ladder) in order and return the first rung whose `showIf`
-passes (absent `showIf` = always). Return `null` if the ladder is empty/absent or nothing
-matches. Array order is significant — first match wins. The vector carries the full
-`Character` (with its `dialogues` ladder) as an input field.
+Saliency model (ws 17). Gather the dialogues whose `offer.character ?? speakerId` equals
+`character.id`; the presence of `offer` is the opt-in (a dialogue without it is never a
+candidate). Keep the ones whose `offer.when` passes (absent = always); when a `visited` set
+is given, drop the non-replayable ones already in it. Pick the winner by:
 
-> **Feed model (contract change).** `activeDialogues` was removed from
-> `SerializedGameState`. `set_active_dialogue` now sets the flag
-> `active_dialogue__{character}` (see `apply_effect.json`), and dialogue resolution is
-> always the ladder via `resolveCharacterDialogue`. Older serialized states that carry an
-> `activeDialogues` field should ignore it.
+1. `offer.priority ?? 0` — descending (tier)
+2. condition specificity of `offer.when` — descending (leaf 1, `all` sum, `any` **min**, `not` operand, absent 0)
+3. `id` — ascending, ordinal / UTF-16 code-unit compare (NOT locale collation)
+
+Return `null` if no offer is eligible. The vector carries the offered dialogues under
+`project.dialogues` and an optional `visited` list; array order is NOT significant anywhere.
+
+> **Feed model.** `set_active_dialogue` sets the flag `active_dialogue__{character}` (see
+> `apply_effect.json`); a forced dialogue is a tier-1 offer whose `when` reads that flag.
+> There is no `activeDialogues` map in `SerializedGameState`; states carrying one ignore it.
 
 ### progression
 Each vector carries a `config` (the `progression.json` shape) and dispatches on `fn`:
