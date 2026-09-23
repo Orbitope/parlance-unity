@@ -244,6 +244,91 @@ namespace Parlance.Tests
             }
         }
 
+        [Test]
+        public void NextContinuations()
+        {
+            var vectors = Load("nextContinuations.json");
+            Assert.NotNull(vectors);
+            foreach (var vObj in vectors)
+            {
+                var v = (Dictionary<string, object>)vObj;
+                var state = State.FromDict((Dictionary<string, object>)v["state"]);
+                var project = (Dictionary<string, object>)v["project"];
+                var visited = v.ContainsKey("visited") ? (List<object>)v["visited"] : new List<object>();
+
+                // Compared by id, as the reference harness does.
+                var got = new List<object>();
+                foreach (var c in Runtime.NextContinuations(state, project, visited, (string)v["currentDialogueId"]))
+                {
+                    if ((string)c["kind"] == "cutscene")
+                    {
+                        got.Add(new Dictionary<string, object> { { "kind", "cutscene" }, { "cutscene", ((Dictionary<string, object>)c["cutscene"])["id"] } });
+                    }
+                    else
+                    {
+                        got.Add(new Dictionary<string, object>
+                        {
+                            { "kind", "dialogue" },
+                            { "characterId", c["characterId"] },
+                            { "dialogue", ((Dictionary<string, object>)c["dialogue"])["id"] },
+                            { "queued", c["queued"] }
+                        });
+                    }
+                }
+                AssertDeepEqual(v["expected"], got, (string)v["description"]);
+            }
+        }
+
+        [Test]
+        public void ResolveQuests()
+        {
+            var vectors = Load("resolve_quests.json");
+            Assert.NotNull(vectors);
+            foreach (var vObj in vectors)
+            {
+                var v = (Dictionary<string, object>)vObj;
+                var state = State.FromDict((Dictionary<string, object>)v["state"]);
+                var project = (Dictionary<string, object>)v["project"];
+
+                var result = Runtime.ResolveQuests(state, project);
+                var firings = new List<object>();
+                foreach (Dictionary<string, object> f in (List<object>)result["firings"])
+                {
+                    firings.Add(new Dictionary<string, object> { { "quest", f["quest"] }, { "kind", f["kind"] }, { "id", f["id"] } });
+                }
+                var got = new Dictionary<string, object>
+                {
+                    { "state", ((State)result["state"]).ToDict() },
+                    { "firings", firings }
+                };
+                AssertDeepEqual(v["expected"], got, (string)v["description"]);
+            }
+        }
+
+        // progression.json mixes five functions; the vector's `fn` picks one.
+        [Test]
+        public void Progression()
+        {
+            var vectors = Load("progression.json");
+            Assert.NotNull(vectors);
+            foreach (var vObj in vectors)
+            {
+                var v = (Dictionary<string, object>)vObj;
+                var config = (Dictionary<string, object>)v["config"];
+                string fn = (string)v["fn"];
+                object got = fn switch
+                {
+                    "levelForXp" => Runtime.LevelForXp(Convert.ToSingle(v["xp"]), config),
+                    "pointsEarned" => Runtime.PointsEarned(Convert.ToSingle(v["xp"]), config),
+                    "availablePoints" => Runtime.AvailablePoints(State.FromDict((Dictionary<string, object>)v["state"]), config),
+                    "investSkillPoint" => Runtime.InvestSkillPoint(State.FromDict((Dictionary<string, object>)v["state"]), (string)v["skillId"], config).ToDict(),
+                    "recomputeSkills" => Runtime.RecomputeSkills(State.FromDict((Dictionary<string, object>)v["state"]), config).ToDict(),
+                    _ => throw new InvalidOperationException($"unknown progression fn '{fn}'")
+                };
+                AssertDeepEqual(v["expected"], got, $"{fn}: {v["description"]}");
+            }
+        }
+
         private Func<float> RngFrom(object spec)
         {
             List<object> values = spec is List<object> l ? l : new List<object> { spec };

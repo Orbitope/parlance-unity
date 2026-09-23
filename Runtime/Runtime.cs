@@ -700,6 +700,223 @@ namespace Parlance
             return string.CompareOrdinal(ia, ib) < 0;
         }
 
+        // ------------------------------------------------------ nextContinuations --
+
+        public static string ActiveDialogueFlag(string characterId) => "active_dialogue__" + characterId;
+
+        // Clears a character's forced-dialogue flag once its forced dialogue is consumed.
+        public static State ClearActiveDialogue(string characterId, State state)
+        {
+            var next = state.Copy();
+            next.Flags[ActiveDialogueFlag(characterId)] = false;
+            return next;
+        }
+
+        public static State ClearPendingCutscene(State state)
+        {
+            var next = state.Copy();
+            next.PendingCutscene = null;
+            return next;
+        }
+
+        // What to offer when the current scene ends. Each entry is
+        // { kind: "cutscene", cutscene } or { kind: "dialogue", characterId, dialogue, queued }.
+        // A pending cutscene comes first. Then forced routing: characters whose
+        // active_dialogue__ flag is set and whose winning offer reads that flag
+        // (queued, visited ignored); if any, only those. Otherwise discovery:
+        // each character's best eligible offer with the visited filter. The
+        // current dialogue is excluded and ids are de-duplicated.
+        public static List<Dictionary<string, object>> NextContinuations(State state, Dictionary<string, object> project, IEnumerable<object> visited, string currentDialogueId)
+        {
+            var seen = new HashSet<string> { currentDialogueId };
+            var dialogues = project.TryGetValue("dialogues", out var dObj) && dObj is Dictionary<string, object> dd ? dd : new Dictionary<string, object>();
+            var characters = project.TryGetValue("characters", out var cObj) && cObj is Dictionary<string, object> cd ? cd : new Dictionary<string, object>();
+
+            var pending = new List<Dictionary<string, object>>();
+            if (state.PendingCutscene != null
+                && project.TryGetValue("cutscenes", out var csObj) && csObj is Dictionary<string, object> cutscenes
+                && cutscenes.TryGetValue(state.PendingCutscene, out var cutscene) && cutscene is Dictionary<string, object>)
+            {
+                pending.Add(new Dictionary<string, object> { { "kind", "cutscene" }, { "cutscene", cutscene } });
+            }
+
+            var forced = new List<Dictionary<string, object>>();
+            foreach (var chObj in characters.Values)
+            {
+                if (!(chObj is Dictionary<string, object> character)) continue;
+                string charId = character.TryGetValue("id", out var cid) ? cid?.ToString() ?? "" : "";
+                string flag = ActiveDialogueFlag(charId);
+                if (!(state.Flags.TryGetValue(flag, out var set) && set)) continue;
+                var resolved = ResolveCharacterDialogue(state, character, project)?.ToString();
+                if (resolved == null || !(dialogues.TryGetValue(resolved, out var dlgObj) && dlgObj is Dictionary<string, object> dialogue)) continue;
+                var offer = dialogue.TryGetValue("offer", out var oObj) ? oObj as Dictionary<string, object> : null;
+                object when = null;
+                offer?.TryGetValue("when", out when);
+                if (!ConditionReadsFlag(when, flag)) continue;
+                if (seen.Add(resolved))
+                {
+                    forced.Add(new Dictionary<string, object> { { "kind", "dialogue" }, { "characterId", charId }, { "dialogue", dialogue }, { "queued", true } });
+                }
+            }
+            if (forced.Count > 0) return pending.Concat(forced).ToList();
+
+            var discovered = new List<Dictionary<string, object>>();
+            foreach (var chObj in characters.Values)
+            {
+                if (!(chObj is Dictionary<string, object> character)) continue;
+                string charId = character.TryGetValue("id", out var cid) ? cid?.ToString() ?? "" : "";
+                var resolved = ResolveCharacterDialogue(state, character, project, visited ?? new List<object>())?.ToString();
+                if (resolved == null || !(dialogues.TryGetValue(resolved, out var dlgObj) && dlgObj is Dictionary<string, object> dialogue)) continue;
+                if (seen.Add(resolved))
+                {
+                    discovered.Add(new Dictionary<string, object> { { "kind", "dialogue" }, { "characterId", charId }, { "dialogue", dialogue }, { "queued", false } });
+                }
+            }
+            return pending.Concat(discovered).ToList();
+        }
+
+        // Does this gate require `flag` to be true, as a top-level conjunct
+        // (an `all` flattened)? The test for a forced offer.
+        private static bool ConditionReadsFlag(object conditionObj, string flag)
+        {
+            if (!(conditionObj is Dictionary<string, object> c)) return false;
+            string type = c.TryGetValue("type", out var t) ? t as string : null;
+            if (type == "all")
+            {
+                return c.TryGetValue("of", out var ofObj) && ofObj is IEnumerable<object> of && of.Any(x => ConditionReadsFlag(x, flag));
+            }
+            return type == "flag"
+                && c.TryGetValue("flag", out var f) && f as string == flag
+                && c.TryGetValue("value", out var v) && v is bool b && b;
+        }
+
+        // ---------------------------------------------------------- resolveQuests --
+
+        public static string QuestFiredKey(string questId, string kind, string id) => $"{questId}/{kind}/{id}";
+
+        // Fires quest stage onComplete / outcome effects whose completeWhen /
+        // reachedWhen holds, once each (recorded in QuestFired), to a fixpoint.
+        // Order: quests by ordinal id, then stages, then outcomes in array
+        // order. Effects with no condition never auto-fire; QuestStages is
+        // never written. Returns { state, firings: [{ quest, kind, id, effects }] }.
+        public static Dictionary<string, object> ResolveQuests(State state, Dictionary<string, object> project)
+        {
+            var quests = project.TryGetValue("quests", out var qObj) && qObj is Dictionary<string, object> qd ? qd : new Dictionary<string, object>();
+            var questIds = quests.Keys.ToList();
+            questIds.Sort(string.CompareOrdinal);
+
+            var current = state;
+            var firings = new List<object>();
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                foreach (var qid in questIds)
+                {
+                    if (!(quests[qid] is Dictionary<string, object> quest)) continue;
+                    foreach (var item in Items(quest, "stages"))
+                    {
+                        var next = TryFire(current, project, qid, "stage", item, "completeWhen", "onComplete", firings);
+                        if (next != null) { current = next; changed = true; }
+                    }
+                    foreach (var item in Items(quest, "outcomes"))
+                    {
+                        var next = TryFire(current, project, qid, "outcome", item, "reachedWhen", "effects", firings);
+                        if (next != null) { current = next; changed = true; }
+                    }
+                }
+            }
+            return new Dictionary<string, object> { { "state", current }, { "firings", firings } };
+        }
+
+        private static IEnumerable<Dictionary<string, object>> Items(Dictionary<string, object> quest, string key)
+        {
+            return quest.TryGetValue(key, out var obj) && obj is IEnumerable<object> list
+                ? list.OfType<Dictionary<string, object>>()
+                : Enumerable.Empty<Dictionary<string, object>>();
+        }
+
+        // One item's firing attempt: the new state if it fired, else null.
+        private static State TryFire(State state, Dictionary<string, object> project, string questId, string kind, Dictionary<string, object> item, string whenKey, string effectsKey, List<object> firings)
+        {
+            if (!(item.TryGetValue(effectsKey, out var effObj) && effObj is List<object> effects && effects.Count > 0)) return null;
+            if (!item.TryGetValue(whenKey, out var when)) return null;
+            string id = item.TryGetValue("id", out var idObj) ? idObj?.ToString() ?? "" : "";
+            string key = QuestFiredKey(questId, kind, id);
+            if (state.QuestFired.Contains(key)) return null;
+            if (!Evaluate(when as Dictionary<string, object>, state, project)) return null;
+            // Effects are non-empty, so ApplyEffects has already copied.
+            var next = ApplyEffects(effects, state, project);
+            next.QuestFired.Add(key);
+            firings.Add(new Dictionary<string, object> { { "quest", questId }, { "kind", kind }, { "id", id }, { "effects", effects } });
+            return next;
+        }
+
+        // ------------------------------------------------------------ progression --
+        // Xp is total-earned and monotonic; levels and points derive from it.
+        // `config` is progression.json; `skills` is the optional skills
+        // registry (id -> skill) for per-skill `max` caps.
+
+        public static int LevelForXp(float xp, Dictionary<string, object> config)
+        {
+            int level = 0;
+            if (config.TryGetValue("xpThresholds", out var tObj) && tObj is List<object> thresholds)
+            {
+                for (int i = 0; i < thresholds.Count; i++)
+                {
+                    if (xp >= Convert.ToSingle(thresholds[i])) level = i;
+                    else break;
+                }
+            }
+            return level;
+        }
+
+        public static float PointsEarned(float xp, Dictionary<string, object> config)
+        {
+            float perLevel = config.TryGetValue("pointsPerLevel", out var p) ? Convert.ToSingle(p) : 0f;
+            return LevelForXp(xp, config) * perLevel;
+        }
+
+        public static float SkillCap(string skillId, Dictionary<string, object> config, Dictionary<string, object> skills = null)
+        {
+            if (skills != null && skills.TryGetValue(skillId, out var sObj) && sObj is Dictionary<string, object> skill && skill.TryGetValue("max", out var max))
+                return Convert.ToSingle(max);
+            return config.TryGetValue("maxSkill", out var m) ? Convert.ToSingle(m) : 0f;
+        }
+
+        public static float EffectiveSkill(string skillId, State state, Dictionary<string, object> config, Dictionary<string, object> skills = null)
+        {
+            float preset = config.TryGetValue("startingSkills", out var ssObj) && ssObj is Dictionary<string, object> ss && ss.TryGetValue(skillId, out var pv) ? Convert.ToSingle(pv) : 0f;
+            float invested = state.SkillPointsSpent.TryGetValue(skillId, out var iv) ? iv : 0f;
+            return Math.Min(preset + invested, SkillCap(skillId, config, skills));
+        }
+
+        public static float AvailablePoints(State state, Dictionary<string, object> config)
+        {
+            return PointsEarned(state.Xp, config) - state.SkillPointsSpent.Values.Sum();
+        }
+
+        // Skills = EffectiveSkill for every preset or invested skill; others untouched.
+        public static State RecomputeSkills(State state, Dictionary<string, object> config, Dictionary<string, object> skills = null)
+        {
+            var next = state.Copy();
+            var ids = new HashSet<string>(state.SkillPointsSpent.Keys);
+            if (config.TryGetValue("startingSkills", out var ssObj) && ssObj is Dictionary<string, object> ss) ids.UnionWith(ss.Keys);
+            foreach (var id in ids) next.Skills[id] = EffectiveSkill(id, state, config, skills);
+            return next;
+        }
+
+        // Spends one point. A player action, not an effect: a no-op unless a
+        // point is available and the skill is below its ceiling.
+        public static State InvestSkillPoint(State state, string skillId, Dictionary<string, object> config, Dictionary<string, object> skills = null)
+        {
+            if (AvailablePoints(state, config) <= 0) return state;
+            if (EffectiveSkill(skillId, state, config, skills) >= SkillCap(skillId, config, skills)) return state;
+            var next = state.Copy();
+            next.SkillPointsSpent[skillId] = (next.SkillPointsSpent.TryGetValue(skillId, out var v) ? v : 0f) + 1f;
+            return RecomputeSkills(next, config, skills);
+        }
+
         // ------------------------------------------------------ speaker / portrait --
         
         public static object EffectiveSpeakerId(Dictionary<string, object> dialogue, Dictionary<string, object> node)

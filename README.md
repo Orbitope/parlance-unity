@@ -10,11 +10,9 @@ This package reads that JSON and runs it in Unity: dialogues, conditions, effect
 
 | parlance-unity | Parlance spec | Families |
 |---|---|---|
-| `main` (unreleased) | v0.14.0 — pinned to [`f4a25b0`](conformance/PIN) | 8 of 11 |
+| `main` (unreleased) | v0.14.0 — pinned to [`f4a25b0`](conformance/PIN) | 11 of 11 |
 
 [`conformance/PIN`](conformance/PIN) is the authoritative record of which upstream ref the vectors came from.
-
-Not ported yet: `resolveQuests`, `progression` and `nextContinuations`. Their vectors are vendored but no test runs them.
 
 ## Install
 
@@ -72,6 +70,9 @@ var nextNodeId = outcome.GetValueOrDefault("nextNodeId"); // null on a terminal 
 - **`onEnter` effects are not applied for you.** `StepDialogue` returns them; firing them is the caller's job, on first arrival only. Applying them on every render double-counts on a rewind.
 - **A node with no choices is not necessarily over.** If it has `next`, call `AdvanceNode` — that's a listen-only beat. Treating it as the end silently truncates ambient chains.
 - **Passive checks never roll.** Show or hide a passive-check choice with `PassiveCheckPasses` (`skill + Σbonus >= difficulty`), so a check modifier means the same thing in both modes.
+- **Run `ResolveQuests` after every state change.** It fires quest stage `onComplete` and outcome `effects` whose condition holds, once each, and records them in `QuestFired`. It never advances a stage for you.
+- **Levelling is derived, not stored.** `Xp` is total-earned; `LevelForXp`, `PointsEarned` and `AvailablePoints` derive from it. `InvestSkillPoint` is a guarded player action, not an effect; call `RecomputeSkills` on load so checks read preset + invested skill.
+- **When a scene ends, ask `NextContinuations`.** A pending cutscene comes first, then any character routed with `set_active_dialogue`, otherwise each character's best offer. Consume them with `ClearPendingCutscene` / `ClearActiveDialogue`.
 - **Which dialogue a character opens is `ResolveCharacterDialogue`.** It ranks the dialogues whose `offer` names that character (priority tier, then condition specificity, then id); pass your visited set so non-replayable dialogues are not offered twice.
 
 ## Verify it yourself
