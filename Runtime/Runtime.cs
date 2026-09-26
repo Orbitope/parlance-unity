@@ -300,6 +300,11 @@ namespace Parlance
                     next.Texts[variable] = value;
                     break;
                 }
+                case "engine":
+                    // Contract 0.15: an opaque command for the host engine. The
+                    // runtime never interprets it and returns the state unchanged;
+                    // the engine dispatches on `command` as it walks the effects.
+                    break;
             }
             return next;
         }
@@ -435,101 +440,206 @@ namespace Parlance
             return (1, 20);
         }
         
-        // ----------------------------------------------------------- stepDialogue --
-        
-        public static Dictionary<string, object> StepDialogue(Dictionary<string, object> dialogue, string nodeId, State state, Dictionary<string, object> project = null)
+        // ------------------------------------------------------------ resolveNode --
+
+        // Whether a failed node showIf SKIPS this node (interstitial narration: no
+        // choices, not isEnd) or only hides its LINE (contract 0.15). One
+        // definition, read by ResolveNode and NodeTextHidden.
+        public static bool IsSkippableNode(Dictionary<string, object> node)
+        {
+            bool hasChoices = node.TryGetValue("choices", out var cObj) && cObj is IEnumerable<object> cList && cList.Any();
+            bool isEnd = node.TryGetValue("isEnd", out var eObj) && eObj is bool e && e;
+            return !hasChoices && !isEnd;
+        }
+
+        private static bool HasGate(Dictionary<string, object> node, out object gate)
+        {
+            return node.TryGetValue("showIf", out gate) && gate != null;
+        }
+
+        private static bool Holds(object condition, State state, Dictionary<string, object> project)
+        {
+            return Evaluate(condition as Dictionary<string, object> ?? new Dictionary<string, object>(), state, project);
+        }
+
+        private static string DialogueId(Dictionary<string, object> dialogue)
+        {
+            return dialogue.TryGetValue("id", out var dId) && dId != null ? dId.ToString() : "?";
+        }
+
+        // The node the player actually reaches from `nodeId`: walks past
+        // INTERSTITIAL nodes whose showIf fails, following `next`. A gated node
+        // with choices or isEnd is never skipped — a failed gate there hides only
+        // its line (see StepResolvedNode's textHidden). This is the one skip walk;
+        // StepDialogue and AdvanceNode both use it, so a gated node behaves the
+        // same however it is reached. A skipped node is inert: no text, no onEnter.
+        //
+        // Judged ONCE, on arrival, against the arrival state — before onEnter.
+        // The reference throws on a missing node, a ring of conditional nodes, or
+        // a skipped node with no `next` (all COND-invalid data); this port returns
+        // the message as `error` instead, matching its other entry points.
+        public static (Dictionary<string, object> node, string error) ResolveNode(Dictionary<string, object> dialogue, string nodeId, State state, Dictionary<string, object> project = null)
         {
             if (project == null) project = new Dictionary<string, object>();
-            
-            var node = FindNode(dialogue, nodeId);
-            if (node == null)
+            var seen = new HashSet<string>();
+            string currentId = nodeId;
+            while (true)
             {
-                string diagId = dialogue.TryGetValue("id", out var dId) ? dId.ToString() : "?";
-                return new Dictionary<string, object> { { "error", $"node '{nodeId}' does not exist in dialogue '{diagId}'" } };
+                var node = FindNode(dialogue, currentId);
+                if (node == null)
+                    return (null, $"node '{currentId}' does not exist in dialogue '{DialogueId(dialogue)}'");
+                if (!HasGate(node, out var gate) || !IsSkippableNode(node) || Holds(gate, state, project))
+                    return (node, null);
+                if (!seen.Add(currentId))
+                    return (null, $"Cycle among conditional nodes in dialogue '{DialogueId(dialogue)}' at '{currentId}'");
+                if (!node.TryGetValue("next", out var nextObj) || nextObj == null)
+                    return (null, $"conditional node '{currentId}' in dialogue '{DialogueId(dialogue)}' has showIf but no 'next' to skip to");
+                currentId = nextObj.ToString();
             }
+        }
 
-            // Node-level showIf skip walk (contract 0.11.0): stepping onto a gated
-            // node whose gate fails resolves to the node the player actually sees —
-            // the same skip AdvanceNode performs, so a caller landing here by any path
-            // renders the shown node, not the hidden one. A ring of failing gates is
-            // COND-invalid and reported rather than looped.
-            {
-                var seen = new HashSet<string>();
-                while (node.TryGetValue("showIf", out var gateObj)
-                       && !Evaluate(gateObj as Dictionary<string, object> ?? new Dictionary<string, object>(), state, project))
-                {
-                    string here = node.TryGetValue("id", out var hId) ? hId.ToString() : nodeId;
-                    if (!seen.Add(here))
-                    {
-                        return new Dictionary<string, object> { { "error", "Cycle among conditional nodes: resolution cannot escape" } };
-                    }
-                    if (!node.ContainsKey("next"))
-                    {
-                        return new Dictionary<string, object> { { "error", $"conditional node '{here}' has no 'next' to skip to" } };
-                    }
-                    string nextId = node["next"]?.ToString();
-                    var nextNode = FindNode(dialogue, nextId);
-                    if (nextNode == null)
-                    {
-                        string diagId = dialogue.TryGetValue("id", out var dId) ? dId.ToString() : "?";
-                        return new Dictionary<string, object> { { "error", $"next target '{nextId}' does not exist in dialogue '{diagId}'" } };
-                    }
-                    node = nextNode;
-                }
-            }
+        // Whether a node's LINE is withheld at this state: a failed gate on a node
+        // that is not skippable (it has choices or isEnd). Judge it against the
+        // ARRIVAL state, the same moment as the skip gate.
+        public static bool NodeTextHidden(Dictionary<string, object> node, State state, Dictionary<string, object> project = null)
+        {
+            if (project == null) project = new Dictionary<string, object>();
+            return HasGate(node, out var gate) && !IsSkippableNode(node) && !Holds(gate, state, project);
+        }
 
-            var visible = new List<object>();
+        // How a choice whose showIf fails is presented: choice.whenLocked, else
+        // rules.choices.whenLockedDefault, else "hide".
+        public static string ResolveWhenLocked(Dictionary<string, object> choice, Dictionary<string, object> project = null)
+        {
+            if (choice.TryGetValue("whenLocked", out var wl) && wl is string wlStr) return wlStr;
+            if (project != null
+                && project.TryGetValue("rules", out var rObj) && rObj is Dictionary<string, object> rules
+                && rules.TryGetValue("choices", out var cObj) && cObj is Dictionary<string, object> choiceRules
+                && choiceRules.TryGetValue("whenLockedDefault", out var dObj) && dObj is string dStr)
+                return dStr;
+            return "hide";
+        }
+
+        // THE one place the fallback and whenLocked rules live; StepResolvedNode
+        // and ChooseChoice both read it, so a choice can never be offered by one
+        // and refused by the other. Returns the authored choice objects.
+        //   visible — passing non-fallback choices; or, only when there are none,
+        //             the passing fallback choices. Authored order.
+        //   locked  — failing choices whose whenLocked resolves to "show".
+        public static (List<Dictionary<string, object>> visible, List<Dictionary<string, object>> locked) PartitionChoices(Dictionary<string, object> node, State state, Dictionary<string, object> project = null)
+        {
+            if (project == null) project = new Dictionary<string, object>();
+            var all = new List<Dictionary<string, object>>();
             if (node.TryGetValue("choices", out var choicesObj) && choicesObj is IEnumerable<object> choicesList)
             {
-                foreach (var choiceObj in choicesList)
+                foreach (var cObj in choicesList)
+                    if (cObj is Dictionary<string, object> c) all.Add(c);
+            }
+            var passes = all.Select(ch => !HasGate(ch, out var g) || Holds(g, state, project)).ToList();
+            bool IsFallback(Dictionary<string, object> ch) => ch.TryGetValue("fallback", out var f) && f is bool fb && fb;
+            bool anyPrimary = all.Where((ch, i) => passes[i] && !IsFallback(ch)).Any();
+
+            var visible = new List<Dictionary<string, object>>();
+            var locked = new List<Dictionary<string, object>>();
+            for (int i = 0; i < all.Count; i++)
+            {
+                var ch = all[i];
+                if (passes[i])
                 {
-                    if (!(choiceObj is Dictionary<string, object> choice)) continue;
-                    if (choice.TryGetValue("showIf", out var showIfObj) && !Evaluate(showIfObj as Dictionary<string, object> ?? new Dictionary<string, object>(), state, project)) continue;
-                    
-                    string text = choice.TryGetValue("text", out var tObj) ? tObj.ToString() : "";
-                    string rendered = Interpolate.Process(text, state);
-                    
-                    if (rendered == text)
-                    {
-                        visible.Add(choice);
-                    }
-                    else
-                    {
-                        var c = new Dictionary<string, object>(choice);
-                        c["text"] = rendered;
-                        visible.Add(c);
-                    }
+                    if (anyPrimary ? !IsFallback(ch) : IsFallback(ch)) visible.Add(ch);
+                }
+                else if (ResolveWhenLocked(ch, project) == "show")
+                {
+                    locked.Add(ch);
                 }
             }
-            
-            var outNode = node;
-            string nodeText = node.TryGetValue("text", out var nTextObj) ? nTextObj.ToString() : "";
-            string renderedText = Interpolate.Process(nodeText, state);
-            if (renderedText != nodeText)
+            return (visible, locked);
+        }
+
+        // A choice with `text` and `lockedText` interpolated; the same object when
+        // nothing changed, so callers comparing identity still see the original.
+        private static Dictionary<string, object> InterpolateChoice(Dictionary<string, object> choice, State state)
+        {
+            Dictionary<string, object> copy = null;
+            foreach (var key in new[] { "text", "lockedText" })
             {
-                outNode = new Dictionary<string, object>(node);
-                outNode["text"] = renderedText;
+                if (!choice.TryGetValue(key, out var tObj) || !(tObj is string text)) continue;
+                string rendered = Interpolate.Process(text, state);
+                if (rendered == text) continue;
+                copy ??= new Dictionary<string, object>(choice);
+                copy[key] = rendered;
+            }
+            return copy ?? choice;
+        }
+
+        // ----------------------------------------------------------- stepDialogue --
+
+        // Presentation of a node that has ALREADY been resolved (see ResolveNode).
+        // Resolution happens once per arrival; a caller that applies onEnter
+        // between resolving and presenting uses this, passing the post-effect
+        // state as `state` and the ARRIVAL state as `arrivalState`: textHidden is
+        // part of the arrival answer, only choice filtering and interpolation
+        // read the post-effect state. `arrivalState` defaults to `state`.
+        public static Dictionary<string, object> StepResolvedNode(Dictionary<string, object> node, State state, Dictionary<string, object> project = null, State arrivalState = null)
+        {
+            if (project == null) project = new Dictionary<string, object>();
+            var (visibleRaw, lockedRaw) = PartitionChoices(node, state, project);
+            var visible = visibleRaw.Select(ch => (object)InterpolateChoice(ch, state)).ToList();
+            var locked = lockedRaw.Select(ch => (object)InterpolateChoice(ch, state)).ToList();
+            bool textHidden = NodeTextHidden(node, arrivalState ?? state, project);
+
+            // Copies preserve every authored key (tags included) untouched.
+            var outNode = node;
+            if (textHidden)
+            {
+                outNode = new Dictionary<string, object>(node) { ["text"] = "" };
+            }
+            else if (node.TryGetValue("text", out var tObj) && tObj is string nodeText)
+            {
+                // A text-less node (0.15: allowed with choices) is left text-less.
+                string rendered = Interpolate.Process(nodeText, state);
+                if (rendered != nodeText)
+                {
+                    outNode = new Dictionary<string, object>(node) { ["text"] = rendered };
+                }
             }
 
+            object onEnter = node.TryGetValue("onEnter", out var oe) && oe != null ? oe : new List<object>();
             return new Dictionary<string, object>
             {
                 { "node", outNode },
                 { "visibleChoices", visible },
-                { "onEnterEffects", node.TryGetValue("onEnter", out var onEnter) ? onEnter : new List<object>() }
+                { "lockedChoices", locked },
+                { "textHidden", textHidden },
+                { "onEnterEffects", onEnter }
             };
         }
 
+        // Resolve (skip walk, once, against `state`) then present. The node
+        // returned may not be the one requested: read its id off the result.
+        public static Dictionary<string, object> StepDialogue(Dictionary<string, object> dialogue, string nodeId, State state, Dictionary<string, object> project = null)
+        {
+            if (project == null) project = new Dictionary<string, object>();
+            var (node, error) = ResolveNode(dialogue, nodeId, state, project);
+            if (error != null) return new Dictionary<string, object> { { "error", error } };
+            return StepResolvedNode(node, state, project);
+        }
+
         // ----------------------------------------------------------- chooseChoice --
-        
+
+        // Returns an `error` (message contains "not selectable") unless the choice
+        // is in PartitionChoices' visible set at `state`: a hidden choice, a locked
+        // one, and a fallback while a non-fallback choice is visible are refused.
+        // Its nextNodeId is the requested target, not yet resolved — the next
+        // StepDialogue resolves it.
         public static Dictionary<string, object> ChooseChoice(Dictionary<string, object> dialogue, string nodeId, string choiceId, State state, Dictionary<string, object> project = null, Func<float> rng = null)
         {
             if (project == null) project = new Dictionary<string, object>();
-            
+
             var node = FindNode(dialogue, nodeId);
             if (node == null)
             {
-                string diagId = dialogue.TryGetValue("id", out var dId) ? dId.ToString() : "?";
-                return new Dictionary<string, object> { { "error", $"node '{nodeId}' does not exist in dialogue '{diagId}'" } };
+                return new Dictionary<string, object> { { "error", $"node '{nodeId}' does not exist in dialogue '{DialogueId(dialogue)}'" } };
             }
 
             Dictionary<string, object> choice = null;
@@ -547,6 +657,10 @@ namespace Parlance
             if (choice == null)
             {
                 return new Dictionary<string, object> { { "error", $"choice '{choiceId}' does not exist on node '{nodeId}'" } };
+            }
+            if (!PartitionChoices(node, state, project).visible.Any(c => ReferenceEquals(c, choice)))
+            {
+                return new Dictionary<string, object> { { "error", $"choice '{choiceId}' in node '{nodeId}' is not selectable at this state (hidden, locked, or an unoffered fallback)" } };
             }
 
             IEnumerable<object> effects = choice.TryGetValue("effects", out var effObj) && effObj is IEnumerable<object> effList ? effList : new List<object>();
@@ -595,56 +709,38 @@ namespace Parlance
         }
 
         // ------------------------------------------------------------ advanceNode --
-        
-        public static Dictionary<string, object> AdvanceNode(Dictionary<string, object> dialogue, string nodeId, State state)
+
+        // Resolves `node.next` for a listen-only beat. No effects are applied and
+        // the target's onEnter is NOT fired (caller's job, as for a goto arrival).
+        // The returned id is post-skip: the target goes through ResolveNode, the
+        // same walk StepDialogue uses, so a gated target with choices or isEnd is
+        // returned (line hidden), never skipped.
+        public static Dictionary<string, object> AdvanceNode(Dictionary<string, object> dialogue, string nodeId, State state, Dictionary<string, object> project = null)
         {
+            if (project == null) project = new Dictionary<string, object>();
             var node = FindNode(dialogue, nodeId);
             if (node == null)
             {
-                string diagId = dialogue.TryGetValue("id", out var dId) ? dId.ToString() : "?";
-                return new Dictionary<string, object> { { "error", $"node '{nodeId}' does not exist in dialogue '{diagId}'" } };
+                return new Dictionary<string, object> { { "error", $"node '{nodeId}' does not exist in dialogue '{DialogueId(dialogue)}'" } };
             }
 
-            if (!node.ContainsKey("next"))
+            if (!node.TryGetValue("next", out var targetIdObj) || targetIdObj == null)
             {
                 return new Dictionary<string, object> { { "error", $"node '{nodeId}' has no 'next' to advance from" } };
             }
 
-            object targetIdObj = node["next"];
-            string targetId = targetIdObj != null ? targetIdObj.ToString() : null;
-
-            // Node-level showIf skip walk (contract 0.11.0). If the target node is
-            // gated and its gate fails, cross it to its own `next` and keep walking
-            // until a node with no gate — or a passing gate — is reached; that is the
-            // node the player sees. A ring of all-failing gates cannot escape (it is
-            // COND-invalid data) and is reported rather than looped forever. onEnter
-            // is NOT fired here: advance is navigation, exactly as the ungated path is.
-            var emptyProject = new Dictionary<string, object>();
-            var visited = new HashSet<string>();
-            while (true)
+            string targetId = targetIdObj.ToString();
+            if (FindNode(dialogue, targetId) == null)
             {
-                var targetNode = FindNode(dialogue, targetId);
-                if (targetNode == null)
-                {
-                    string diagId = dialogue.TryGetValue("id", out var dId) ? dId.ToString() : "?";
-                    return new Dictionary<string, object> { { "error", $"next target '{targetId}' does not exist in dialogue '{diagId}'" } };
-                }
-                if (!targetNode.TryGetValue("showIf", out var gateObj)) break;
-                if (Evaluate(gateObj as Dictionary<string, object> ?? new Dictionary<string, object>(), state, emptyProject)) break;
-                if (!visited.Add(targetId))
-                {
-                    return new Dictionary<string, object> { { "error", "Cycle among conditional nodes: resolution cannot escape" } };
-                }
-                if (!targetNode.ContainsKey("next"))
-                {
-                    return new Dictionary<string, object> { { "error", $"conditional node '{targetId}' has no 'next' to skip to" } };
-                }
-                targetId = targetNode["next"]?.ToString();
+                return new Dictionary<string, object> { { "error", $"next target '{targetId}' does not exist in dialogue '{DialogueId(dialogue)}'" } };
             }
+
+            var (resolved, error) = ResolveNode(dialogue, targetId, state, project);
+            if (error != null) return new Dictionary<string, object> { { "error", error } };
 
             return new Dictionary<string, object>
             {
-                { "nextNodeId", targetId },
+                { "nextNodeId", resolved["id"] },
                 { "newState", state }
             };
         }

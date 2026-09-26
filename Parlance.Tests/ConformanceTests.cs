@@ -123,12 +123,20 @@ namespace Parlance.Tests
                     Assert.Fail($"unexpected error: {outDict["error"]} - {(string)v["description"]}");
                 }
                 
+                var expected = (Dictionary<string, object>)v["expected"];
                 var visibleChoices = (List<object>)outDict["visibleChoices"];
                 var ids = new List<object>();
+                var tags = new List<object>();
                 foreach (var choiceObj in visibleChoices)
                 {
                     var choice = (Dictionary<string, object>)choiceObj;
                     ids.Add(choice.ContainsKey("id") ? choice["id"] : null);
+                    tags.Add(choice.TryGetValue("tags", out var t) ? t : null);
+                }
+                var lockedIds = new List<object>();
+                foreach (Dictionary<string, object> choice in (List<object>)outDict["lockedChoices"])
+                {
+                    lockedIds.Add(choice.ContainsKey("id") ? choice["id"] : null);
                 }
                 var onEnterEffects = (IEnumerable<object>)outDict["onEnterEffects"];
 
@@ -139,12 +147,18 @@ namespace Parlance.Tests
 
                 var got = new Dictionary<string, object>
                 {
-                    { "nodeId", outNode.TryGetValue("id", out var idObj) ? idObj : null },
                     { "visibleChoiceIds", ids },
+                    { "lockedChoiceIds", lockedIds },
                     { "onEnterEffectCount", onEnterList.Count },
                     { "onEnterEffects", onEnterList }
                 };
-                AssertDeepEqual((Dictionary<string, object>)v["expected"], got, (string)v["description"]);
+                // Optional fields are checked whenever the vector states them.
+                if (expected.ContainsKey("nodeId")) got["nodeId"] = outNode.TryGetValue("id", out var idObj) ? idObj : null;
+                if (expected.ContainsKey("textHidden")) got["textHidden"] = outDict["textHidden"];
+                if (expected.ContainsKey("text")) got["text"] = outNode.TryGetValue("text", out var textObj) ? textObj : null;
+                if (expected.ContainsKey("nodeTags")) got["nodeTags"] = outNode.TryGetValue("tags", out var nodeTags) ? nodeTags : null;
+                if (expected.ContainsKey("visibleChoiceTags")) got["visibleChoiceTags"] = tags;
+                AssertDeepEqual(expected, got, (string)v["description"]);
             }
         }
 
@@ -166,6 +180,13 @@ namespace Parlance.Tests
                 var rng = RngFrom(rngSpec);
                 
                 var outDict = Runtime.ChooseChoice(diag, nodeId, choiceId, state, project, rng);
+
+                if (v.ContainsKey("expectedError"))
+                {
+                    AssertExpectedError(v, outDict);
+                    continue;
+                }
+
                 if (outDict.ContainsKey("error"))
                 {
                     Assert.Fail($"unexpected error: {outDict["error"]} - {(string)v["description"]}");
@@ -197,15 +218,13 @@ namespace Parlance.Tests
                 var nodeId = (string)v["nodeId"];
                 var state = State.FromDict((Dictionary<string, object>)v["state"]);
                 
-                var outDict = Runtime.AdvanceNode(diag, nodeId, state);
+                var project = v.ContainsKey("project") ? (Dictionary<string, object>)v["project"] : new Dictionary<string, object>();
+
+                var outDict = Runtime.AdvanceNode(diag, nodeId, state, project);
                 
                 if (v.ContainsKey("expectedError"))
                 {
-                    string expectedErr = (string)v["expectedError"];
-                    if (!outDict.ContainsKey("error"))
-                        Assert.Fail($"expected error containing {expectedErr}, but succeeded - {(string)v["description"]}");
-                    string errStr = outDict["error"].ToString();
-                    Assert.IsTrue(errStr.Contains(expectedErr), $"error {errStr} does not contain {expectedErr}");
+                    AssertExpectedError(v, outDict);
                     continue;
                 }
                 
@@ -327,6 +346,17 @@ namespace Parlance.Tests
                 };
                 AssertDeepEqual(v["expected"], got, $"{fn}: {v["description"]}");
             }
+        }
+
+        // The reference throws; this port returns { error }. Either way the
+        // message must contain the vector's expectedError substring.
+        private void AssertExpectedError(Dictionary<string, object> v, Dictionary<string, object> outDict)
+        {
+            string expectedErr = (string)v["expectedError"];
+            if (!outDict.ContainsKey("error"))
+                Assert.Fail($"expected error containing {expectedErr}, but succeeded - {(string)v["description"]}");
+            string errStr = outDict["error"].ToString();
+            Assert.IsTrue(errStr.Contains(expectedErr), $"error {errStr} does not contain {expectedErr} - {(string)v["description"]}");
         }
 
         private Func<float> RngFrom(object spec)

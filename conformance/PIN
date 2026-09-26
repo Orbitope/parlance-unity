@@ -3,7 +3,10 @@
 # These vectors are a PINNED COPY, not a fork. Never hand-edit them: they are
 # generated from and asserted against the reference implementation, so an edit
 # here makes this port chase a ghost. Re-copy from the named ref instead.
-parlanceVersion=v0.14.0
-parlanceCommit=f4a25b0d94ca8569a2897e8354a3f1317f826a82
+# PRE-TAG: v0.15.0 is not tagged yet. parlanceCommit names the release-prep
+# commit the tag will be cut from (branch claude/release-0-15-prep-mi2lm0).
+# Once v0.15.0 is tagged, move parlanceCommit to the tag commit and re-copy.
+parlanceVersion=v0.15.0
+parlanceCommit=440369d0af4a9f829a525843c16f7762e1d18d32
 parlanceRepo=git@github.com:Orbitope/parlance.git
 #
