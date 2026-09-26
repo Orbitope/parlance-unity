@@ -12,7 +12,7 @@ This package reads that JSON and runs it in Unity: dialogues (conditional lines,
 |---|---|---|
 | `main` (unreleased) | v0.15.0 — pinned to [`a3c6454`](conformance/PIN) | 11 of 11 — 207 / 207 vectors |
 
-[`conformance/PIN`](conformance/PIN) is the authoritative record of which upstream ref the vectors came from. The v0.15.0 pin names the release-prep commit the tag will be cut from; it moves to the tag commit once v0.15.0 is tagged.
+[`conformance/PIN`](conformance/PIN) is the authoritative record of which upstream ref the vectors came from.
 
 ## Install
 
